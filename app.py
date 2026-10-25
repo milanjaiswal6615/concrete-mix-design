@@ -2,7 +2,14 @@ import re
 from datetime import date
 import streamlit as st
 import pandas as pd
+import json
+import os
 import concrete_mix_design as engine
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 st.set_page_config(page_title="Concrete Intelligence | Mix Design", page_icon="🏗️", layout="wide")
 
@@ -103,6 +110,86 @@ def parse_statement(text):
         data["control"] = "Good"; evidence["control"] = "Good site control stated"
     return data, evidence
 
+def interpret_with_ai(text):
+    """Use a language model to interpret the problem; never calculate mix quantities here."""
+    api_key = None
+    try:
+        api_key = st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        api_key = None
+    api_key = api_key or os.getenv("OPENAI_API_KEY")
+    if not api_key or OpenAI is None:
+        data, evidence = parse_statement(text)
+        a = engine.analyse_job(text)
+        if not data.get("grade") and a.grades:
+            data["grade"] = a.grades[0]
+            evidence["grade"] = f"Detected grade M{a.grades[0]} by local analysis"
+        if not data.get("slump") and a.slump:
+            data["slump"] = a.slump
+            evidence["slump"] = f"Detected {a.slump} mm slump by local analysis"
+        if not data.get("max_size") and a.max_size:
+            data["max_size"] = a.max_size
+            evidence["max_size"] = f"Detected {a.max_size} mm aggregate by local analysis"
+        return data, evidence, {
+            "mode": "fallback",
+            "summary": "AI is not connected yet. This is a local rule-based interpretation, not generative AI.",
+            "facts": list(evidence.values()),
+            "inferences": ([data["exposure_hint"]] if data.get("exposure_hint") else []),
+            "questions": ["Add an OpenAI API key in Streamlit Secrets to enable natural-language AI interpretation."],
+            "confidence": "limited"
+        }
+
+    client = OpenAI(api_key=api_key)
+    schema = {
+        "type": "object",
+        "properties": {
+            "grade": {"type": ["integer", "null"]},
+            "slump": {"type": ["integer", "null"]},
+            "max_size": {"type": ["integer", "null"]},
+            "member": {"type": ["string", "null"], "enum": ["RCC", "PCC", None]},
+            "exposure": {"type": ["string", "null"], "enum": ["Mild", "Moderate", "Severe", "Very severe", "Extreme", None]},
+            "cement_type": {"type": ["string", "null"], "enum": ["OPC 33", "OPC 43", "OPC 53", "PPC", "PSC", None]},
+            "fa_zone": {"type": ["string", "null"], "enum": ["I", "II", "III", "IV", None]},
+            "placing": {"type": ["string", "null"], "enum": ["Normal", "Pumped", "Tremie", None]},
+            "control": {"type": ["string", "null"], "enum": ["Good", "Fair", None]},
+            "facts": {"type": "array", "items": {"type": "string"}},
+            "inferences": {"type": "array", "items": {"type": "string"}},
+            "questions": {"type": "array", "items": {"type": "string"}},
+            "summary": {"type": "string"},
+            "confidence": {"type": "string", "enum": ["high", "medium", "low"]}
+        },
+        "required": ["grade", "slump", "max_size", "member", "exposure", "cement_type", "fa_zone", "placing", "control", "facts", "inferences", "questions", "summary", "confidence"],
+        "additionalProperties": False
+    }
+    system_prompt = (
+        "You are the natural-language intake assistant for an Indian concrete mix-design prototype. "
+        "Interpret the complete user statement, not just keywords. Extract only values explicitly stated as facts. "
+        "Identify plausible engineering inferences separately; never turn an inference into a confirmed input. "
+        "High strength does not specify an exact M-grade. Good workability does not specify a numeric slump. "
+        "Coastal alone does not uniquely determine exposure class: distinguish sheltered coastal air, general coastal exposure, "
+        "sea-water spray/splash, full immersion and tidal zone, and ask a focused question if needed. "
+        "Never invent cement type, aggregate grading, slump, site control or material test results. "
+        "For a column/beam/slab/footing, RCC may be a reasonable inference but label it as an inference. "
+        "Do not calculate mix proportions. Ask only essential follow-up questions, prioritizing inputs that affect code compliance. "
+        "Keep statements concise. This is not a substitute for a qualified engineer."
+    )
+    response = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        temperature=0.1,
+        response_format={"type": "json_schema", "json_schema": {"name": "concrete_job_interpretation", "strict": True, "schema": schema}},
+        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": text}]
+    )
+    out = json.loads(response.choices[0].message.content)
+    keys = ["grade", "slump", "max_size", "member", "exposure", "cement_type", "fa_zone", "placing", "control"]
+    data = {k: out[k] for k in keys if out.get(k) is not None}
+    if data.get("cement_type"):
+        data["cement_class"] = engine.CEMENT_CLASS[data["cement_type"]]
+    if out.get("exposure") is None and ("coastal" in text.lower() or "marine" in text.lower()):
+        data["exposure_hint"] = "Coastal exposure needs clarification; the AI has not assigned a final exposure class."
+    evidence = {f"fact_{i+1}": fact for i, fact in enumerate(out["facts"])}
+    return data, evidence, {"mode": "ai", **out}
+
+
 with st.sidebar:
     st.markdown("### Workspace")
     st.caption("Natural-language mix design")
@@ -139,17 +226,22 @@ c_a, c_b = st.columns([1, 4])
 with c_a:
     analyse_clicked = st.button("Understand requirement", type="primary", use_container_width=True)
 with c_b:
-    st.markdown("<p class='small-muted'>The first version extracts explicitly stated values using transparent rules. It does not yet call a hosted generative-AI model.</p>", unsafe_allow_html=True)
+    st.markdown("<p class='small-muted'>AI extracts context and separates facts from inferences. Confirm safety-critical details before calculating.</p>", unsafe_allow_html=True)
 
 if analyse_clicked:
     if not statement.strip():
         st.warning("Describe the concrete requirement first.")
     else:
-        parsed, evidence = parse_statement(statement)
-        st.session_state.parsed = parsed
-        st.session_state.evidence = evidence
-        st.session_state.draft = None
-        st.session_state.result = None
+        try:
+            parsed, evidence, interpretation = interpret_with_ai(statement)
+            st.session_state.parsed = parsed
+            st.session_state.evidence = evidence
+            st.session_state.interpretation = interpretation
+            st.session_state.draft = None
+            st.session_state.result = None
+        except Exception as exc:
+            st.error(f"AI interpretation failed: {exc}")
+            st.info("Check that OPENAI_API_KEY is set in Streamlit Secrets and that the key has API access. No mix calculation has been run.")
 
 if st.session_state.parsed is not None:
     parsed = st.session_state.parsed
@@ -157,9 +249,23 @@ if st.session_state.parsed is not None:
     st.markdown("---")
     st.subheader("02 · What we understood")
     st.caption("Values extracted from your sentence are prefilled. Confirm or change them below; inferred or missing values are never silently treated as facts.")
+    interpretation = st.session_state.get("interpretation", {})
+    if interpretation.get("mode") == "fallback":
+        st.warning(interpretation.get("summary", "AI is not connected."))
+    elif interpretation:
+        st.success("AI interpretation completed · confidence: " + interpretation.get("confidence", "not rated"))
+        st.write(interpretation.get("summary", ""))
     if evidence:
         for k, v in evidence.items():
             st.write(f"✓ **{k.replace('_',' ').title()}** — {v}")
+    if interpretation.get("inferences"):
+        st.markdown("#### Engineering inferences — not confirmed facts")
+        for item in interpretation["inferences"]:
+            st.write(f"- {item}")
+    if interpretation.get("questions"):
+        st.markdown("#### Clarifications the assistant thinks are needed")
+        for item in interpretation["questions"]:
+            st.write(f"- {item}")
     if parsed.get("exposure_hint"):
         st.warning(parsed["exposure_hint"])
     if not parsed:
@@ -222,7 +328,7 @@ if st.session_state.parsed is not None:
             # Material values above are user-entered or clearly labelled assumptions.
             spec.assumed_materials = ["sg_cement", "sg_fa", "sg_ca", "abs_fa", "abs_ca"]
             spec.assumptions = [
-                "This UI uses conservative extraction rules, not a generative AI model.",
+                "AI-assisted intake is not a code-compliance engine; confirm all inferred inputs.",
                 "Default material properties and admixture performance must be replaced by supplier/lab data.",
                 "The underlying calculation engine documents approximate strength/w-c curves and unverified code-data items."
             ]
