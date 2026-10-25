@@ -1,139 +1,285 @@
-
+import re
+from datetime import date
 import streamlit as st
-import concrete_mix_design as C
+import pandas as pd
+import concrete_mix_design as engine
 
-st.set_page_config(
-    page_title="Concrete Mix Design",
-    page_icon="🏗️",
-    layout="wide"
+st.set_page_config(page_title="Concrete Intelligence | Mix Design", page_icon="🏗️", layout="wide")
+
+# ---------- Visual system ----------
+st.markdown("""
+<style>
+:root { --ink:#14283f; --muted:#64748b; --line:#e2e8f0; --blue:#1d4ed8; }
+.block-container {padding-top: 2rem; padding-bottom: 3rem; max-width: 1180px;}
+.hero {padding: 1.7rem 1.8rem; border:1px solid #dbe5f0; border-radius:18px;
+       background:linear-gradient(120deg,#f8fbff 0%,#edf4fb 100%); margin-bottom:1.2rem;}
+.eyebrow {font-size:.76rem; letter-spacing:.13em; font-weight:750; color:#1d4ed8; text-transform:uppercase;}
+.hero h1 {font-size:2.2rem; line-height:1.15; color:#14283f; margin:.45rem 0;}
+.hero p {color:#52657b; max-width:780px; margin-bottom:0;}
+div[data-testid="stMetric"] {border:1px solid #e2e8f0; border-radius:12px; padding:14px; background:white;}
+section[data-testid="stSidebar"] {background:#f8fafc;}
+.small-muted {color:#64748b;font-size:.88rem;}
+</style>
+""", unsafe_allow_html=True)
+
+if "parsed" not in st.session_state:
+    st.session_state.parsed = None
+if "draft" not in st.session_state:
+    st.session_state.draft = None
+if "result" not in st.session_state:
+    st.session_state.result = None
+
+st.markdown("""
+<div class="hero">
+  <div class="eyebrow">Concrete Intelligence · IS 10262:2019 / IS 456:2000</div>
+  <h1>Describe the concrete. We'll work through the design.</h1>
+  <p>Start with an ordinary sentence. The assistant extracts what it can, identifies uncertainty,
+  asks for essential missing details, then sends confirmed inputs to the calculation engine.</p>
+</div>
+""", unsafe_allow_html=True)
+
+st.info("Engineering prototype: output is a preliminary trial mix, not construction approval or a compliance certificate. The underlying engine contains documented approximations and unverified code-data items; review these before relying on results.")
+
+def parse_statement(text):
+    """Conservative local extraction: extract only values explicitly stated."""
+    low = text.lower()
+    data = {}
+    evidence = {}
+    # Grade
+    matches = re.findall(r'(?<![a-z0-9])m\s?(\d{2})(?![a-z0-9])', low)
+    if not matches:
+        matches = re.findall(r'\bgrade\s+(?:of\s+)?(?:m\s?)?(\d{2})\b', low)
+    valid = [int(x) for x in matches if int(x) in [10,15,20,25,30,35,40,45,50,55,60,65,70,75,80]]
+    if valid:
+        data["grade"] = valid[0]; evidence["grade"] = f"Found M{valid[0]} in your statement"
+    # slump
+    sm = re.search(r'slump[^0-9]{0,15}(\d{2,3})', low)
+    if not sm:
+        sm = re.search(r'(\d{2,3})\s*mm\s*slump', low)
+    if sm and 10 <= int(sm.group(1)) <= 300:
+        data["slump"] = int(sm.group(1)); evidence["slump"] = f"Found {sm.group(1)} mm slump"
+    # aggregate size (avoid matching the slump number by removing slump phrase)
+    low2 = re.sub(r'slump[^.]{0,25}', ' ', low)
+    am = re.search(r'\b(10|20|40)\s*mm\s*(?:nominal\s*)?(?:size\s*)?(?:aggregate|agg)?\b', low2)
+    if am:
+        data["max_size"] = int(am.group(1)); evidence["max_size"] = f"Found {am.group(1)} mm aggregate"
+    # member / application
+    if any(k in low for k in ["column", "beam", "slab", "footing", "pile", "rcc", "reinforced concrete"]):
+        data["member"] = "RCC"; evidence["member"] = "Reinforced concrete application detected"
+    elif "plain concrete" in low or re.search(r'\bpcc\b', low):
+        data["member"] = "PCC"; evidence["member"] = "Plain concrete detected"
+    # Exposure only when explicitly named; environmental descriptions need confirmation.
+    for term, val in [("very severe","Very severe"), ("extreme","Extreme"), ("severe","Severe"), ("moderate","Moderate"), ("mild","Mild")]:
+        if re.search(r'\b'+re.escape(term)+r'\b', low):
+            data["exposure"] = val; evidence["exposure"] = f"Explicitly mentions {val} exposure"
+            break
+    if "tidal" in low:
+        data["exposure_hint"] = "Tidal exposure may indicate Extreme exposure; confirm actual exposure classification."
+    elif "sea water spray" in low or "sea-water spray" in low:
+        data["exposure_hint"] = "Sea-water spray may indicate Very severe exposure; confirm against IS 456 and project conditions."
+    elif "coastal" in low or "marine" in low or "salt air" in low:
+        data["exposure_hint"] = "Coastal/marine environment detected. Severity depends on actual exposure (e.g. sheltered, wet/dry cycles, spray, tidal zone); please confirm."
+    # cement
+    for term, val, cls in [("opc 33","OPC 33",33),("opc 43","OPC 43",43),("opc 53","OPC 53",53),("ppc","PPC",43),("psc","PSC",43)]:
+        if term in low:
+            data["cement_type"] = val; data["cement_class"] = cls
+            evidence["cement_type"] = f"Found {val}"
+            break
+    # aggregate zone
+    zm = re.search(r'\bzone\s*(i{1,3}|iv|[1-4])\b', low)
+    if zm:
+        z = zm.group(1).upper()
+        data["fa_zone"] = {"1":"I","2":"II","3":"III","4":"IV"}.get(z,z)
+        evidence["fa_zone"] = f"Found fine aggregate Zone {data['fa_zone']}"
+    # placing
+    if "pump" in low:
+        data["placing"] = "Pumped"; evidence["placing"] = "Pumped placement detected"
+    elif "tremie" in low:
+        data["placing"] = "Tremie"; evidence["placing"] = "Tremie placement detected"
+    # control
+    if "fair site control" in low:
+        data["control"] = "Fair"; evidence["control"] = "Fair site control stated"
+    elif "good site control" in low:
+        data["control"] = "Good"; evidence["control"] = "Good site control stated"
+    return data, evidence
+
+with st.sidebar:
+    st.markdown("### Workspace")
+    st.caption("Natural-language mix design")
+    st.markdown("---")
+    st.markdown("**Workflow**")
+    st.write("1. Describe the job")
+    st.write("2. Confirm extracted details")
+    st.write("3. Resolve missing inputs")
+    st.write("4. Review preliminary results")
+    st.markdown("---")
+    st.caption("Calculation engine: concrete_mix_design.py")
+
+st.subheader("01 · Describe your requirement")
+examples = [
+    "M40 reinforced concrete column, severe exposure, 100 mm slump, 20 mm crushed aggregate, OPC 53, Zone II sand.",
+    "High-strength concrete for a coastal building column with good workability.",
+    "M30 concrete for an indoor slab, 75 mm slump, 20 mm aggregate.",
+]
+with st.expander("Try an example"):
+    for i, ex in enumerate(examples):
+        if st.button(ex, key=f"example_{i}", use_container_width=True):
+            st.session_state.statement = ex
+            st.rerun()
+
+statement = st.text_area(
+    "Concrete requirement",
+    key="statement",
+    height=125,
+    placeholder="Example: I need high-strength concrete for a reinforced column in a coastal area, with good workability and 100 mm slump…",
+    help="Write naturally. Include any details you already know; you do not need to know every technical parameter."
 )
 
-st.title("🏗️ Concrete Mix Design Assistant")
-st.caption("IS 10262:2019 · IS 456:2000")
-st.warning(
-    "Educational and preliminary design tool only. "
-    "Verify applicable IS provisions, actual material test data, "
-    "and trial mixes before construction use."
-)
+c_a, c_b = st.columns([1, 4])
+with c_a:
+    analyse_clicked = st.button("Understand requirement", type="primary", use_container_width=True)
+with c_b:
+    st.markdown("<p class='small-muted'>The first version extracts explicitly stated values using transparent rules. It does not yet call a hosted generative-AI model.</p>", unsafe_allow_html=True)
 
-with st.form("mix_design_form"):
-    st.subheader("1. Design requirements")
+if analyse_clicked:
+    if not statement.strip():
+        st.warning("Describe the concrete requirement first.")
+    else:
+        parsed, evidence = parse_statement(statement)
+        st.session_state.parsed = parsed
+        st.session_state.evidence = evidence
+        st.session_state.draft = None
+        st.session_state.result = None
 
-    col1, col2 = st.columns(2)
+if st.session_state.parsed is not None:
+    parsed = st.session_state.parsed
+    evidence = st.session_state.get("evidence", {})
+    st.markdown("---")
+    st.subheader("02 · What we understood")
+    st.caption("Values extracted from your sentence are prefilled. Confirm or change them below; inferred or missing values are never silently treated as facts.")
+    if evidence:
+        for k, v in evidence.items():
+            st.write(f"✓ **{k.replace('_',' ').title()}** — {v}")
+    if parsed.get("exposure_hint"):
+        st.warning(parsed["exposure_hint"])
+    if not parsed:
+        st.warning("I couldn't confidently extract technical values. Use the fields below to confirm the essential design inputs.")
 
-    with col1:
-        grade = st.selectbox(
-            "Concrete grade",
-            [15, 20, 25, 30, 35, 40, 45, 50, 55, 60],
-            index=1,
-            format_func=lambda x: f"M{x}"
-        )
-        member = st.selectbox("Member type", ["RCC", "PCC"])
-        exposure = st.selectbox(
-            "Exposure condition",
-            C.EXPOSURES,
-            index=1
-        )
-        slump = st.slider("Required slump (mm)", 10, 150, 75)
+    with st.form("confirm_inputs"):
+        col1, col2, col3 = st.columns(3)
+        grades = [20,25,30,35,40,45,50,55,60,65,70,75,80]
+        with col1:
+            grade = st.selectbox("Concrete grade", grades, index=grades.index(parsed.get("grade", 30)) if parsed.get("grade",30) in grades else 2)
+            exposure_opts = engine.EXPOSURES
+            exposure = st.selectbox("Exposure condition", exposure_opts, index=exposure_opts.index(parsed.get("exposure", "Moderate")) if parsed.get("exposure","Moderate") in exposure_opts else 1)
+            member = st.selectbox("Concrete type", ["RCC","PCC"], index=["RCC","PCC"].index(parsed.get("member","RCC")))
+        with col2:
+            slump = st.number_input("Target slump (mm)", min_value=10, max_value=300, value=int(parsed.get("slump", 100)), step=5)
+            max_size = st.selectbox("Nominal aggregate size (mm)", [10,20,40], index=[10,20,40].index(parsed.get("max_size",20)) if parsed.get("max_size",20) in [10,20,40] else 1)
+            cement_type = st.selectbox("Cement type", list(engine.CEMENT_CLASS.keys()), index=list(engine.CEMENT_CLASS.keys()).index(parsed.get("cement_type","OPC 53")) if parsed.get("cement_type","OPC 53") in engine.CEMENT_CLASS else 2)
+        with col3:
+            zone = st.selectbox("Fine aggregate zone", ["I","II","III","IV"], index=["I","II","III","IV"].index(parsed.get("fa_zone","II")) if parsed.get("fa_zone","II") in ["I","II","III","IV"] else 1)
+            placing = st.selectbox("Placement method", ["Normal","Pumped","Tremie"], index=["Normal","Pumped","Tremie"].index(parsed.get("placing","Normal")))
+            control = st.selectbox("Site control", ["Good","Fair"], index=["Good","Fair"].index(parsed.get("control","Good")))
+        with st.expander("Material data and admixture (optional; defaults are assumptions)"):
+            a1,a2,a3 = st.columns(3)
+            with a1:
+                sg_cement = st.number_input("Cement specific gravity", 2.5, 3.5, 3.15, 0.01)
+                sg_fa = st.number_input("Fine aggregate specific gravity (SSD)", 2.0, 3.5, 2.65, 0.01)
+                sg_ca = st.number_input("Coarse aggregate specific gravity (SSD)", 2.0, 3.5, 2.70, 0.01)
+            with a2:
+                abs_fa = st.number_input("Fine aggregate absorption (%)", 0.0, 15.0, 1.0, 0.1)
+                abs_ca = st.number_input("Coarse aggregate absorption (%)", 0.0, 15.0, 0.5, 0.1)
+                fa_mc = st.number_input("Fine aggregate moisture (%) — 0 means SSD assumption", 0.0, 40.0, 0.0, 0.1)
+            with a3:
+                ca_mc = st.number_input("Coarse aggregate moisture (%) — 0 means SSD assumption", 0.0, 40.0, 0.0, 0.1)
+                admix_dose = st.number_input("Superplasticizer dosage (% binder)", 0.0, 5.0, 1.0, 0.1)
+                admix_red = st.number_input("Water reduction (%) from admixture", 0.0, 40.0, 20.0, 1.0)
+        submitted = st.form_submit_button("Confirm inputs & calculate", type="primary", use_container_width=True)
 
-    with col2:
-        cement_type = st.selectbox(
-            "Cement type",
-            ["OPC 33", "OPC 43", "OPC 53", "PPC", "PSC"],
-            index=2
-        )
-        max_size = st.selectbox(
-            "Maximum aggregate size (mm)", [10, 20, 40], index=1
-        )
-        fa_zone = st.selectbox(
-            "Fine aggregate zone", ["I", "II", "III", "IV"], index=1
-        )
-        agg_shape = st.selectbox(
-            "Aggregate shape",
-            ["crushed", "subangular", "gravel+crushed", "rounded"]
-        )
+    if submitted:
+        try:
+            spec = engine.Spec()
+            spec.grade = int(grade)
+            spec.exposure = exposure
+            spec.member = member
+            spec.slump = int(slump)
+            spec.max_size = int(max_size)
+            spec.cement_type = cement_type
+            spec.cement_class = engine.CEMENT_CLASS[cement_type]
+            spec.fa_zone = zone
+            spec.placing = placing
+            spec.control = control
+            spec.sg_cement = float(sg_cement)
+            spec.sg_fa = float(sg_fa)
+            spec.sg_ca = float(sg_ca)
+            spec.abs_fa = float(abs_fa)
+            spec.abs_ca = float(abs_ca)
+            spec.mc_fa = float(fa_mc) if fa_mc > 0 else None
+            spec.mc_ca = float(ca_mc) if ca_mc > 0 else None
+            spec.admix_dose = float(admix_dose)
+            spec.admix_red = float(admix_red)
+            # Material values above are user-entered or clearly labelled assumptions.
+            spec.assumed_materials = ["sg_cement", "sg_fa", "sg_ca", "abs_fa", "abs_ca"]
+            spec.assumptions = [
+                "This UI uses conservative extraction rules, not a generative AI model.",
+                "Default material properties and admixture performance must be replaced by supplier/lab data.",
+                "The underlying calculation engine documents approximate strength/w-c curves and unverified code-data items."
+            ]
+            if parsed.get("exposure_hint"):
+                spec.decisions.append(parsed["exposure_hint"])
+            result = engine.compute(spec)
+            trials = [result]
+            for delta in (-0.03, 0.03):
+                try:
+                    trials.append(engine.compute(spec, wcm_override=round(result["wcm_design"] + delta, 2), water_override=result["water"]))
+                except ValueError:
+                    pass
+            report = engine.build_report(spec, result, trials)
+            st.session_state.result = {"spec": spec, "data": result, "report": report, "trials": trials}
+        except Exception as exc:
+            st.error(f"Could not calculate this mix: {exc}")
+            st.caption("Check the inputs. This prototype does not cover every special concrete type or project-specific durability condition.")
 
-    st.subheader("2. Material properties")
-
-    col3, col4 = st.columns(2)
-
-    with col3:
-        sg_cement = st.number_input(
-            "Cement specific gravity", 2.5, 3.5, 3.15, 0.01
-        )
-        sg_fa = st.number_input(
-            "Fine aggregate specific gravity", 2.0, 3.5, 2.65, 0.01
-        )
-        abs_fa = st.number_input(
-            "Fine aggregate absorption (%)", 0.0, 15.0, 1.0, 0.1
-        )
-
-    with col4:
-        sg_ca = st.number_input(
-            "Coarse aggregate specific gravity", 2.0, 3.5, 2.70, 0.01
-        )
-        abs_ca = st.number_input(
-            "Coarse aggregate absorption (%)", 0.0, 15.0, 0.5, 0.1
-        )
-        control = st.selectbox("Site control", ["Good", "Fair"])
-
-    calculate = st.form_submit_button(
-        "Calculate preliminary mix", type="primary", use_container_width=True
-    )
-
-if calculate:
-    try:
-        spec = C.Spec(
-            grade=grade,
-            cement_type=cement_type,
-            cement_class=C.CEMENT_CLASS[cement_type],
-            max_size=max_size,
-            exposure=exposure,
-            member=member,
-            slump=slump,
-            fa_zone=fa_zone,
-            agg_shape=agg_shape,
-            control=control,
-            sg_cement=sg_cement,
-            sg_fa=sg_fa,
-            sg_ca=sg_ca,
-            abs_fa=abs_fa,
-            abs_ca=abs_ca,
-        )
-
-        with st.spinner("Calculating preliminary mix proportions..."):
-            result = C.compute(spec)
-
-        st.success("Calculation completed. Review all assumptions and warnings.")
-
-        st.subheader("3. Mix design report")
-
-        report = C.build_report(spec, result, [])
-        st.text(report)
-
-        st.download_button(
-            "Download report (.txt)",
-            data=report,
-            file_name="concrete_mix_design_report.txt",
-            mime="text/plain",
-            use_container_width=True
-        )
-
-        if result.get("flags"):
-            st.subheader("Important checks")
-            for flag in result["flags"]:
-                st.warning(flag)
-
-    except Exception as error:
-        st.error(f"Could not complete the calculation: {error}")
-        st.info(
-            "Check the inputs and the calculation engine. "
-            "Do not use an unsuccessful calculation for construction."
-        )
-
-st.divider()
-st.caption(
-    "Preliminary estimates only. Actual aggregate grading, moisture, "
-    "material test results, code compliance and trial-mix validation "
-    "must be checked by a qualified engineer."
-)
+if st.session_state.result:
+    pack = st.session_state.result
+    s, r = pack["spec"], pack["data"]
+    st.markdown("---")
+    st.subheader("03 · Preliminary mix design")
+    st.caption(f"Trial-1 proportions · {date.today().strftime('%d %b %Y')} · per 1 m³")
+    m1,m2,m3,m4 = st.columns(4)
+    m1.metric("Target mean strength", f"{r['target']:.1f} MPa")
+    m2.metric("Water / binder ratio", f"{r['wcm_design']:.2f}")
+    m3.metric("Total binder", f"{r['binder']:.0f} kg/m³")
+    m4.metric("Mixing water", f"{r['water']:.0f} kg/m³")
+    materials = [
+        ("Cement / OPC", r["opc"]),
+        ("Fly ash", r["fly"]),
+        ("GGBS", r["ggbs"]),
+        ("Silica fume", r["sf"]),
+        ("Water (design)", r["water"]),
+        ("Water to add after moisture correction", r["water_b"]),
+        ("Fine aggregate (SSD)", r["fa"]),
+        ("Coarse aggregate (SSD)", r["ca"]),
+        ("Fine aggregate (batch)", r["fa_b"]),
+        ("Coarse aggregate (batch)", r["ca_b"]),
+        ("Admixture", r["adm_mass"]),
+    ]
+    df = pd.DataFrame([{"Material": name, "Quantity per m³": round(value, 2), "Unit": "kg"} for name, value in materials if abs(value) > 1e-8])
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.markdown("#### Mix by mass (based on binder)")
+    binder = r["binder"] or 1
+    st.write(f"**Binder : Fine aggregate : Coarse aggregate = 1 : {r['fa']/binder:.2f} : {r['ca']/binder:.2f}**")
+    st.write(f"**Effective water/binder ratio = {r['wcm_eff']:.2f}**")
+    if r["flags"]:
+        st.markdown("#### Engineering flags to review")
+        for flag in r["flags"]:
+            st.warning(flag)
+    st.markdown("#### Model limitations")
+    for item in engine.UNVERIFIED_ITEMS:
+        st.write(f"- {item}")
+    st.warning("Do not use this output directly for construction. Verify the applicable code clauses and tables, test actual materials, prepare trial batches, test compressive strength/workability, and obtain approval from the responsible qualified engineer.")
+    st.download_button("Download calculation report (.txt)", pack["report"], file_name=f"mix_design_M{s.grade}_{date.today():%Y%m%d}.txt", mime="text/plain", type="primary")
+    st.download_button("Download input summary (.json)", __import__("json").dumps({k:v for k,v in vars(s).items()}, indent=2, default=str), file_name=f"mix_design_inputs_M{s.grade}.json", mime="application/json")
+    with st.expander("Read full calculation report"):
+        st.code(pack["report"], language="text")
