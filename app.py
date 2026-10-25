@@ -7,9 +7,11 @@ import os
 import concrete_mix_design as engine
 
 try:
-    from openai import OpenAI
+    from google import genai
+    from google.genai import types
 except ImportError:
-    OpenAI = None
+    genai = None
+    types = None
 
 st.set_page_config(page_title="Concrete Intelligence | Mix Design", page_icon="🏗️", layout="wide")
 
@@ -114,11 +116,11 @@ def interpret_with_ai(text):
     """Use a language model to interpret the problem; never calculate mix quantities here."""
     api_key = None
     try:
-        api_key = st.secrets.get("OPENAI_API_KEY")
+        api_key = st.secrets.get("GEMINI_API_KEY")
     except Exception:
         api_key = None
-    api_key = api_key or os.getenv("OPENAI_API_KEY")
-    if not api_key or OpenAI is None:
+    api_key = api_key or os.getenv("GEMINI_API_KEY")
+    if not api_key or genai is None or types is None:
         data, evidence = parse_statement(text)
         a = engine.analyse_job(text)
         if not data.get("grade") and a.grades:
@@ -135,31 +137,30 @@ def interpret_with_ai(text):
             "summary": "AI is not connected yet. This is a local rule-based interpretation, not generative AI.",
             "facts": list(evidence.values()),
             "inferences": ([data["exposure_hint"]] if data.get("exposure_hint") else []),
-            "questions": ["Add an OpenAI API key in Streamlit Secrets to enable natural-language AI interpretation."],
+            "questions": ["Add a Gemini API key in Streamlit Secrets to enable natural-language AI interpretation."],
             "confidence": "limited"
         }
 
-    client = OpenAI(api_key=api_key)
+    client = genai.Client(api_key=api_key)
     schema = {
-        "type": "object",
+        "type": "OBJECT",
         "properties": {
-            "grade": {"type": ["integer", "null"]},
-            "slump": {"type": ["integer", "null"]},
-            "max_size": {"type": ["integer", "null"]},
-            "member": {"type": ["string", "null"], "enum": ["RCC", "PCC", None]},
-            "exposure": {"type": ["string", "null"], "enum": ["Mild", "Moderate", "Severe", "Very severe", "Extreme", None]},
-            "cement_type": {"type": ["string", "null"], "enum": ["OPC 33", "OPC 43", "OPC 53", "PPC", "PSC", None]},
-            "fa_zone": {"type": ["string", "null"], "enum": ["I", "II", "III", "IV", None]},
-            "placing": {"type": ["string", "null"], "enum": ["Normal", "Pumped", "Tremie", None]},
-            "control": {"type": ["string", "null"], "enum": ["Good", "Fair", None]},
-            "facts": {"type": "array", "items": {"type": "string"}},
-            "inferences": {"type": "array", "items": {"type": "string"}},
-            "questions": {"type": "array", "items": {"type": "string"}},
-            "summary": {"type": "string"},
-            "confidence": {"type": "string", "enum": ["high", "medium", "low"]}
+            "grade": {"type": "INTEGER", "nullable": True},
+            "slump": {"type": "INTEGER", "nullable": True},
+            "max_size": {"type": "INTEGER", "nullable": True},
+            "member": {"type": "STRING", "nullable": True, "enum": ["RCC", "PCC"]},
+            "exposure": {"type": "STRING", "nullable": True, "enum": ["Mild", "Moderate", "Severe", "Very severe", "Extreme"]},
+            "cement_type": {"type": "STRING", "nullable": True, "enum": ["OPC 33", "OPC 43", "OPC 53", "PPC", "PSC"]},
+            "fa_zone": {"type": "STRING", "nullable": True, "enum": ["I", "II", "III", "IV"]},
+            "placing": {"type": "STRING", "nullable": True, "enum": ["Normal", "Pumped", "Tremie"]},
+            "control": {"type": "STRING", "nullable": True, "enum": ["Good", "Fair"]},
+            "facts": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "inferences": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "questions": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "summary": {"type": "STRING"},
+            "confidence": {"type": "STRING", "enum": ["high", "medium", "low"]}
         },
-        "required": ["grade", "slump", "max_size", "member", "exposure", "cement_type", "fa_zone", "placing", "control", "facts", "inferences", "questions", "summary", "confidence"],
-        "additionalProperties": False
+        "required": ["grade", "slump", "max_size", "member", "exposure", "cement_type", "fa_zone", "placing", "control", "facts", "inferences", "questions", "summary", "confidence"]
     }
     system_prompt = (
         "You are the natural-language intake assistant for an Indian concrete mix-design prototype. "
@@ -171,15 +172,21 @@ def interpret_with_ai(text):
         "Never invent cement type, aggregate grading, slump, site control or material test results. "
         "For a column/beam/slab/footing, RCC may be a reasonable inference but label it as an inference. "
         "Do not calculate mix proportions. Ask only essential follow-up questions, prioritizing inputs that affect code compliance. "
-        "Keep statements concise. This is not a substitute for a qualified engineer."
+        "Return only valid JSON matching the provided response schema. Keep statements concise. This is not a substitute for a qualified engineer."
     )
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        temperature=0.1,
-        response_format={"type": "json_schema", "json_schema": {"name": "concrete_job_interpretation", "strict": True, "schema": schema}},
-        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": text}]
+    prompt = (
+        system_prompt + "\\n\\nInterpret this user requirement:\\n" + text
     )
-    out = json.loads(response.choices[0].message.content)
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            response_mime_type="application/json",
+            response_schema=schema,
+        ),
+    )
+    out = json.loads(response.text)
     keys = ["grade", "slump", "max_size", "member", "exposure", "cement_type", "fa_zone", "placing", "control"]
     data = {k: out[k] for k in keys if out.get(k) is not None}
     if data.get("cement_type"):
@@ -241,7 +248,7 @@ if analyse_clicked:
             st.session_state.result = None
         except Exception as exc:
             st.error(f"AI interpretation failed: {exc}")
-            st.info("Check that OPENAI_API_KEY is set in Streamlit Secrets and that the key has API access. No mix calculation has been run.")
+            st.info("Check that GEMINI_API_KEY is set in Streamlit Secrets and that the key has API access. No mix calculation has been run.")
 
 if st.session_state.parsed is not None:
     parsed = st.session_state.parsed
